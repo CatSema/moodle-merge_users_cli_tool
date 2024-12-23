@@ -60,10 +60,12 @@ def interact_with_cli(csv_file_path):
                         # Передача fromid
                         fd.write(f"{fromid}\n".encode())
                         fd.flush()
+                        time.sleep(1)  # Добавляем задержку для обработки вывода CLI
 
                         # Передача toid
                         fd.write(f"{toid}\n".encode())
                         fd.flush()
+                        time.sleep(1)  # Добавляем задержку для обработки вывода CLI
 
                         output = b""
                         while True:
@@ -72,7 +74,7 @@ def interact_with_cli(csv_file_path):
                             decoded_output = output.decode(errors='ignore')
                             if re.search(r'\d+: Success; Log id: \d+', decoded_output):  # Успешное завершение
                                 break
-                            if "ошибка" in decoded_output.lower():  # Возможная ошибка
+                            if re.search(r'\d+: Error; Log id: \d+', decoded_output):  # Ошибка
                                 break
 
                         success_message = extract_success_message(output.decode(errors='ignore'))
