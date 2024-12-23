@@ -1,10 +1,8 @@
 import csv
-import pty
-import os
 import logging
-import re
-import signal
 import time
+import subprocess
+
 
 def setup_logging():
     """
@@ -21,6 +19,7 @@ def setup_logging():
     console.setFormatter(formatter)
     logging.getLogger('').addHandler(console)
 
+
 def interact_with_cli(csv_file_path):
     """
     Запускает CLI один раз и последовательно передаёт данные из CSV.
@@ -32,82 +31,83 @@ def interact_with_cli(csv_file_path):
             reader = csv.DictReader(csvfile, delimiter=';')
 
             if 'fromid' not in reader.fieldnames or 'toid' not in reader.fieldnames:
-                logging.error("CSV файл должен содержать заголовки 'fromid' и 'toid'.")
+                logging.error(
+                    "CSV файл должен содержать заголовки 'fromid' и 'toid'.")
                 print("Ошибка: Неверный формат CSV файла.")
                 return
 
-            master, slave = pty.openpty()  # Открываем псевдотерминал
-            process = os.fork()
+            process = subprocess.Popen(
+                ['sudo', 'php', '/var/www/html/moodle/admin/tool/mergeusers/cli/climerger.php'],
+                stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True
+            )
 
-            if process == 0:  # Дочерний процесс
-                os.dup2(slave, 0)  # stdin
-                os.dup2(slave, 1)  # stdout
-                os.dup2(slave, 2)  # stderr
-                os.close(master)
-                os.execvp('sudo', ['sudo', 'php', '/var/www/html/moodle/admin/tool/mergeusers/cli/climerger.php'])
-            else:  # Родительский процесс
-                os.close(slave)
+            processed_pairs = set()  # Множество для отслеживания уже обработанных пар
 
-                with os.fdopen(master, 'r+b', buffering=0) as fd:
-                    for row in reader:
-                        fromid = row['fromid'].strip()
-                        toid = row['toid'].strip()
+            for row in reader:
+                fromid = row['fromid'].strip()
+                toid = row['toid'].strip()
 
-                        if not fromid.isdigit() or not toid.isdigit():
-                            logging.warning(f"Пропущена строка с некорректными данными: fromid={fromid}, toid={toid}")
-                            continue
+                if not fromid.isdigit() or not toid.isdigit():
+                    logging.warning(f"Пропущена строка с некорректными данными: fromid={fromid}, toid={toid}")
+                    continue
 
-                        # Передача fromid
-                        fd.write(f"{fromid}\n".encode())
-                        fd.flush()
-                        time.sleep(1)  # Добавляем задержку для обработки вывода CLI
+                # Проверяем, не являются ли fromid и toid одинаковыми
+                if fromid == toid:
+                    logging.warning(f"Пропущена пара с одинаковыми ID: {fromid} -> {toid}")
+                    continue
 
-                        # Передача toid
-                        fd.write(f"{toid}\n".encode())
-                        fd.flush()
-                        time.sleep(1)  # Добавляем задержку для обработки вывода CLI
+                # Проверяем, была ли уже обработана эта пара
+                if (fromid, toid) in processed_pairs:
+                    logging.warning(f"Пропущена пара с уже обработанными ID: {fromid} -> {toid}")
+                    continue
 
-                        output = b""
-                        while True:
-                            data = fd.read(1024)
-                            output += data
-                            decoded_output = output.decode(errors='ignore')
-                            if re.search(r'\d+: Success; Log id: \d+', decoded_output):  # Успешное завершение
-                                break
-                            if re.search(r'\d+: Error; Log id: \d+', decoded_output):  # Ошибка
-                                break
+                # Добавляем пару в множество обработанных
+                processed_pairs.add((fromid, toid))
 
-                        success_message = extract_success_message(output.decode(errors='ignore'))
-                        if success_message:
-                            logging.info(success_message)
-                            print(success_message)
-                        else:
-                            logging.error(f"Ошибка слияния: fromid={fromid}, toid={toid}. Вывод: {output.decode(errors='ignore')}")
-                            print(f"Ошибка: fromid={fromid}, toid={toid}")
+                process.stdin.write(f"{fromid}\n")
+                process.stdin.flush()
+                logging.info(f"Отправлен fromid: {fromid}")
+                time.sleep(1)
 
-                    # Завершаем CLI процесс через Ctrl-C
-                    os.kill(process, signal.SIGINT)
-                    time.sleep(1)  # Даем процессу завершиться
+                process.stdin.write(f"{toid}\n")
+                process.stdin.flush()
+                logging.info(f"Отправлен toid: {toid}")
+                time.sleep(1)
+
+                # Чтение и логирование вывода после каждого ввода
+                while True:
+                    output = process.stdout.readline()
+                    if output == '' and process.poll() is not None:
+                        break
+                    if output:
+                        decoded_output = output.strip()
+                        if "Success" in decoded_output or "Error" in decoded_output:
+                            logging.info(f"Результат слияния: {decoded_output}")
+                            break
+
+            # Завершаем CLI процесс через сигнал завершения
+            process.stdin.write("-1\n")
+            process.stdin.flush()
+            logging.info("Отправлен сигнал завершения (-1).")
+            process.stdin.close()  # Закрытие stdin потока
+            process.wait(timeout=30)  # Ждём завершения CLI процесса
+            logging.info("CLI процесс завершён.")
 
     except FileNotFoundError:
         logging.error(f"Файл не найден: {csv_file_path}")
         print("Ошибка: CSV файл не найден.")
+    except subprocess.TimeoutExpired:
+        logging.warning("CLI процесс не завершился за отведённое время.")
+        print("Ошибка: CLI процесс завис.")
     except KeyboardInterrupt:
         logging.warning("Операция была прервана пользователем.")
         print("Операция прервана.")
     except Exception as e:
         logging.error(f"Общая ошибка: {e}")
         print("Произошла ошибка при обработке.")
-
-def extract_success_message(output):
-    """
-    Извлекает сообщение об успешном объединении из вывода CLI.
-
-    :param output: Строка вывода CLI.
-    :return: Сообщение об успехе или None.
-    """
-    match = re.search(r"From \d+ to \d+: Success; Log id: \d+", output)
-    return match.group(0) if match else None
 
 if __name__ == "__main__":
     try:
